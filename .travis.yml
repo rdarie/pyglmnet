@@ -15,15 +15,19 @@ install:
     - conda create -n testenv --yes pip python=$PYTHON
     - source activate testenv
     - conda install --yes --file requirements.txt
+    - pip install --upgrade twine
     - python setup.py develop
+    - python setup.py sdist bdist_wheel
 
 script:
+    - # Checks whether your distribution’s long description will render correctly on PyPI.
+    - twine check dist/*
     - # Run tests, show verbose output and print the top 10 slowest running tests
     - py.test --cov=pyglmnet tests/ --verbose --durations=10
     - # Run doctests
     - py.test pyglmnet/pyglmnet.py --verbose --doctest-modules 
     - # Run flake8 to check that package and tests adhere to PEP8
-    - flake8 --count pyglmnet tests
+    - make flake
 
 after_success:
     - bash <(curl -s https://codecov.io/bash)
