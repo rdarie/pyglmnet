@@ -4,6 +4,7 @@ import warnings
 from copy import deepcopy
 
 import numpy as np
+from scipy import optimize as scipy_opt
 from scipy.special import expit
 from scipy.stats import norm
 
@@ -122,34 +123,36 @@ def _grad_mu(distr, z, eta):
     return grad_mu
 
 
-def _logL(distr, y, y_hat, z=None):
+def _logL(distr, y, y_hat, z=None, summation=True):
     """The log likelihood."""
     if distr in ['softplus', 'poisson']:
         eps = np.spacing(1)
-        logL = np.sum(y * np.log(y_hat + eps) - y_hat)
+        logL = np.array(y * np.log(y_hat + eps) - y_hat)
     elif distr == 'gaussian':
-        logL = -0.5 * np.sum((y - y_hat)**2)
+        logL = -0.5 * np.array((y - y_hat)**2)
     elif distr == 'binomial':
-
         # prevents underflow
         if z is not None:
-            logL = np.sum(y * z - np.log(1 + np.exp(z)))
+            logL = np.array(y * z - np.log(1 + np.exp(z)))
         # for scoring
         else:
-            logL = np.sum(y * np.log(y_hat) + (1 - y) * np.log(1 - y_hat))
+            logL = np.array(y * np.log(y_hat) + (1 - y) * np.log(1 - y_hat))
     elif distr == 'probit':
         if z is not None:
             pdfz, cdfz = norm.pdf(z), norm.cdf(z)
-            logL = np.sum(y * _probit_g1(z, pdfz, cdfz) +
+            logL = np.array(y * _probit_g1(z, pdfz, cdfz) +
                           (1 - y) * _probit_g2(z, pdfz, cdfz))
         else:
-            logL = np.sum(y * np.log(y_hat) + (1 - y) * np.log(1 - y_hat))
+            logL = np.array(y * np.log(y_hat) + (1 - y) * np.log(1 - y_hat))
     elif distr == 'gamma':
         # see
         # https://www.statistics.ma.tum.de/fileadmin/w00bdb/www/czado/lec8.pdf
         nu = 1.  # shape parameter, exponential for now
-        logL = np.sum(nu * (-y / y_hat - np.log(y_hat)))
-    return logL
+        logL = np.array(nu * (-y / y_hat - np.log(y_hat)))
+    if summation:
+        return np.sum(logL)
+    else:
+        return logL
 
 
 def _penalty(alpha, beta, Tau, group):
@@ -194,21 +197,6 @@ def _L1penalty(beta, group=None):
     return L1penalty
 
 
-def _loss(distr, alpha, Tau, reg_lambda, X, y, eta, group, beta,
-          fit_intercept=True):
-    """Define the objective function for elastic net."""
-    n_samples, n_features = X.shape
-    z = _z(beta[0], beta[1:], X, fit_intercept)
-    y_hat = _mu(distr, z, eta, fit_intercept)
-    L = 1. / n_samples * _logL(distr, y, y_hat, z)
-    if fit_intercept:
-        P = _penalty(alpha, beta[1:], Tau, group)
-    else:
-        P = _penalty(alpha, beta, Tau, group)
-    J = -L + reg_lambda * P
-    return J
-
-
 def _L2loss(distr, alpha, Tau, reg_lambda, X, y, eta, group, beta,
             fit_intercept=True):
     """Define the objective function for elastic net."""
@@ -222,6 +210,50 @@ def _L2loss(distr, alpha, Tau, reg_lambda, X, y, eta, group, beta,
         P = 0.5 * (1 - alpha) * _L2penalty(beta, Tau)
     J = -L + reg_lambda * P
     return J
+
+
+def _loss(distr, alpha, Tau, reg_lambda, X, y, eta, group, beta,
+          fit_intercept=True, summation=True):
+    """Define the objective function for elastic net."""
+    n_samples, n_features = X.shape
+    z = _z(beta[0], beta[1:], X, fit_intercept)
+    y_hat = _mu(distr, z, eta, fit_intercept)
+    L = 1. / n_samples * _logL(distr, y, y_hat, z, summation=summation)
+    if fit_intercept:
+        P = _penalty(alpha, beta[1:], Tau, group)
+    else:
+        P = _penalty(alpha, beta, Tau, group)
+    J = -L + reg_lambda * P
+    return J
+
+
+def _loss_grad(distr, alpha, Tau, reg_lambda, X, y, eta, group, beta,
+          fit_intercept=True, summation=True):
+    """Define the objective function for elastic net."""
+    n_samples, n_features = X.shape
+    z = _z(beta[0], beta[1:], X, fit_intercept)
+    y_hat = _mu(distr, z, eta, fit_intercept)
+    L = 1. / n_samples * _logL(distr, y, y_hat, z, summation=summation)
+    gL = _grad_logloss(
+        distr, X, y, z, eta,
+        fit_intercept=fit_intercept, mu_1d=y_hat)
+    g_reg = _grad_reg(alpha, Tau, reg_lambda, beta, fit_intercept)
+    # detect columns in the design matrix that represent an intercept,
+    # even though fit_intercept was nominally 0
+    allOnes = np.logical_and.reduce((X == 1), axis=0)
+    if allOnes.any():
+        interceptIdx = np.flatnonzero(allOnes)
+        assert interceptIdx.size == 1
+        P = _penalty(alpha, beta[~allOnes], Tau, group)
+        g_reg[interceptIdx] = 0
+    elif fit_intercept:
+        P = _penalty(alpha, beta[1:], Tau, group)
+    else:
+        P = _penalty(alpha, beta, Tau, group)
+    #
+    J = -L + reg_lambda * P
+    gJ = gL + g_reg
+    return J, gJ
 
 
 def _grad_L2loss(distr, alpha, Tau, reg_lambda, X, y, eta, beta,
@@ -286,7 +318,61 @@ def _grad_L2loss(distr, alpha, Tau, reg_lambda, X, y, eta, beta,
     return g
 
 
-def _gradhess_logloss_1d(distr, xk, y, z, eta, fit_intercept=True):
+def _grad_logloss_1d(distr, xk, y, z, eta, fit_intercept=True):
+    """
+    Compute gradient (1st derivative)
+    of log likelihood for a single coordinate.
+
+    Parameters
+    ----------
+    xk: float
+        (n_samples,)
+    y: float
+        (n_samples,)
+    z: float
+        (n_samples,)
+
+    Returns
+    -------
+    gk: gradient, float:
+        (n_features + 1,)
+    """
+    n_samples = xk.shape[0]
+
+    if distr == 'softplus':
+        mu = _mu(distr, z, eta, fit_intercept)
+        s = expit(z)
+        gk = np.sum(s * xk) - np.sum(y * s / mu * xk)
+
+    elif distr == 'poisson':
+        mu = _mu(distr, z, eta, fit_intercept)
+        s = expit(z)
+        gk = np.sum((mu[z <= eta] - y[z <= eta]) *
+                    xk[z <= eta]) + \
+            np.exp(eta) * \
+            np.sum((1 - y[z > eta] / mu[z > eta]) *
+                   xk[z > eta])
+
+    elif distr == 'gaussian':
+        gk = np.sum((z - y) * xk)
+
+    elif distr == 'binomial':
+        mu = _mu(distr, z, eta, fit_intercept)
+        gk = np.sum((mu - y) * xk)
+
+    elif distr == 'probit':
+        pdfz = norm.pdf(z)
+        cdfz = norm.cdf(z)
+        gk = -np.sum((y * _probit_g3(z, pdfz, cdfz) -
+                      (1 - y) * _probit_g4(z, pdfz, cdfz)) * xk)
+
+    elif distr == 'gamma':
+        raise NotImplementedError('cdfast is not implemented for Gamma '
+                                  'distribution')
+    return 1. / n_samples * gk
+
+
+def _hess_logloss_1d(distr, xk, y, z, eta, fit_intercept=True):
     """
     Compute gradient (1st derivative)
     and Hessian (2nd derivative)
@@ -303,8 +389,6 @@ def _gradhess_logloss_1d(distr, xk, y, z, eta, fit_intercept=True):
 
     Returns
     -------
-    gk: gradient, float:
-        (n_features + 1,)
     hk: float:
         (n_features + 1,)
     """
@@ -313,48 +397,223 @@ def _gradhess_logloss_1d(distr, xk, y, z, eta, fit_intercept=True):
     if distr == 'softplus':
         mu = _mu(distr, z, eta, fit_intercept)
         s = expit(z)
-        gk = np.sum(s * xk) - np.sum(y * s / mu * xk)
-
         grad_s = s * (1 - s)
         grad_s_by_mu = grad_s / mu - s / (mu ** 2)
         hk = np.sum(grad_s * xk ** 2) - np.sum(y * grad_s_by_mu * xk ** 2)
 
     elif distr == 'poisson':
         mu = _mu(distr, z, eta, fit_intercept)
-        s = expit(z)
-        gk = np.sum((mu[z <= eta] - y[z <= eta]) *
-                    xk[z <= eta]) + \
-            np.exp(eta) * \
-            np.sum((1 - y[z > eta] / mu[z > eta]) *
-                   xk[z > eta])
         hk = np.sum(mu[z <= eta] * xk[z <= eta] ** 2) + \
             np.exp(eta) ** 2 * \
             np.sum(y[z > eta] / (mu[z > eta] ** 2) *
                    (xk[z > eta] ** 2))
 
     elif distr == 'gaussian':
-        gk = np.sum((z - y) * xk)
         hk = np.sum(xk * xk)
 
     elif distr == 'binomial':
         mu = _mu(distr, z, eta, fit_intercept)
-        gk = np.sum((mu - y) * xk)
         hk = np.sum(mu * (1.0 - mu) * xk * xk)
 
     elif distr == 'probit':
         pdfz = norm.pdf(z)
         cdfz = norm.cdf(z)
-        gk = -np.sum((y * _probit_g3(z, pdfz, cdfz) -
-                      (1 - y) * _probit_g4(z, pdfz, cdfz)) * xk)
         hk = np.sum((y * _probit_g5(z, pdfz, cdfz) +
                      (1 - y) * _probit_g6(z, pdfz, cdfz)) * (xk * xk))
 
     elif distr == 'gamma':
+        raise NotImplementedError(
+            'cdfast is not implemented for Gamma '
+            'distribution')
+
+    return 1. / n_samples * hk
+
+
+def _grad_logloss(distr, X, y, z, eta, fit_intercept=True, mu_1d=None):
+    """
+    Compute gradient (1st derivative)
+    of log likelihood.
+
+    Parameters
+    ----------
+    X: float
+        (n_samples, n_features)
+    y: float
+        (n_samples,)
+    z: float
+        (n_samples, n_features)
+
+    Returns
+    -------
+    gk: gradient, float:
+        (n_features (+ 1),)
+    """
+    n_samples = X.shape[0]
+    n_features = X.shape[1]
+    #
+    if distr not in ['gaussian', 'probit']:
+        if mu_1d is None:
+            mu = np.repeat(
+                _mu(distr, z, eta, fit_intercept)[:, None], n_features, axis=1)
+        else:
+            mu = np.repeat(
+                mu_1d[:, None], n_features, axis=1)
+
+    if distr == 'softplus':
+        s = np.repeat(
+            expit(z)[:, None], n_features, axis=1)
+        y_rep = np.repeat((y)[:, None], n_features, axis=1)
+        gk = np.sum((s * X) * (1 - y_rep / mu), axis=0)
+
+    elif distr == 'poisson':
+        s = np.repeat(expit(z)[:, None], n_features, axis=1)
+        gk = np.sum((mu[z <= eta] - y[z <= eta]) *
+                    X[z <= eta]) + \
+            np.exp(eta) * \
+            np.sum((1 - y[z > eta] / mu[z > eta]) *
+                   X[z > eta])
+
+    elif distr == 'gaussian':
+        gk = np.sum(np.repeat((z - y)[:, None], n_features, axis=1) * X)
+
+    elif distr == 'binomial':
+        gk = np.sum((mu - y) * X)
+
+    elif distr == 'probit':
+        pdfz = norm.pdf(z)
+        cdfz = norm.cdf(z)
+        gk = -np.sum((y * _probit_g3(z, pdfz, cdfz) -
+                      (1 - y) * _probit_g4(z, pdfz, cdfz)) * X)
+
+    elif distr == 'gamma':
         raise NotImplementedError('cdfast is not implemented for Gamma '
                                   'distribution')
+    return 1. / n_samples * gk
 
-    return 1. / n_samples * gk, 1. / n_samples * hk
 
+def _hess_logloss(distr, X, y, z, eta, fit_intercept=True):
+    """
+    and Hessian (2nd derivative)
+    of log likelihood.
+
+    Parameters
+    ----------
+    xk: float
+        (n_samples,)
+    y: float
+        (n_samples,)
+    z: float
+        (n_samples,)
+
+    Returns
+    -------
+    hk: float:
+        (n_features + 1,)
+    """
+    n_samples = X.shape[0]
+    n_features = X.shape[1]
+
+    if distr == 'softplus':
+        mu = _mu(distr, z, eta, fit_intercept)
+        s = expit(z)
+        grad_s = s * (1 - s)
+        grad_s_by_mu = grad_s / mu - s / (mu ** 2)
+        hk = np.sum(grad_s * X ** 2) - np.sum(y * grad_s_by_mu * X ** 2)
+
+    elif distr == 'poisson':
+        mu = _mu(distr, z, eta, fit_intercept)
+        hk = np.sum(mu[z <= eta] * X[z <= eta] ** 2) + \
+            np.exp(eta) ** 2 * \
+            np.sum(y[z > eta] / (mu[z > eta] ** 2) *
+                   (X[z > eta] ** 2))
+
+    elif distr == 'gaussian':
+        hk = np.sum(X * X)
+
+    elif distr == 'binomial':
+        mu = _mu(distr, z, eta, fit_intercept)
+        hk = np.sum(mu * (1.0 - mu) * X * X)
+
+    elif distr == 'probit':
+        pdfz = norm.pdf(z)
+        cdfz = norm.cdf(z)
+        hk = np.sum((y * _probit_g5(z, pdfz, cdfz) +
+                     (1 - y) * _probit_g6(z, pdfz, cdfz)) * (X * X))
+
+    elif distr == 'gamma':
+        raise NotImplementedError(
+            'cdfast is not implemented for Gamma '
+            'distribution')
+
+    return 1. / n_samples * hk
+
+
+def _gradhess_logloss_1d(distr, xk, y, z, eta, fit_intercept=True):
+    gk = _grad_logloss_1d(distr, xk, y, z, eta, fit_intercept)
+    hk = _hess_logloss_1d(distr, xk, y, z, eta, fit_intercept)
+    return gk, hk
+
+
+def _gradhess_reg_1d(Tau, k, beta, fit_intercept=True):
+    if Tau is None:
+        if k == 0 and fit_intercept:
+            gk_reg, hk_reg = 0.0, 0.0
+        else:
+            gk_reg, hk_reg = beta[k], 1.0
+    else:
+        InvCov = np.dot(Tau.T, Tau)
+        if fit_intercept:
+            gk_reg = np.sum(InvCov[k - 1, :] * beta[1:])
+            hk_reg = InvCov[k - 1, k - 1]
+        else:
+            gk_reg = np.sum(InvCov[k, :] * beta)
+            hk_reg = InvCov[k, k]
+    return gk_reg, hk_reg
+
+def _grad_reg_1d(alpha, Tau, reg_lambda, beta_k):
+    if Tau is None:
+        return (
+            reg_lambda * (1 - alpha) * (beta_k) +
+            reg_lambda * alpha * np.sign(beta_k)
+            )
+    else:
+        raise(NotImplementedError('Need to double check for Tau'))
+
+def _grad_reg(alpha, Tau, reg_lambda, beta, fit_intercept=True):
+    if Tau is None:
+        if fit_intercept:
+            g_reg = np.array(
+                [0.0] +
+                [_grad_reg_1d(alpha, Tau, reg_lambda, b) for b in beta])
+        else:
+            g_reg = np.array(
+                [_grad_reg_1d(alpha, Tau, reg_lambda, b) for b in beta])
+    else:
+        raise(NotImplementedError('Need to double check for Tau'))
+    return g_reg
+
+def _hess_reg(Tau, beta, fit_intercept=True):
+    if Tau is None:
+        if fit_intercept:
+            h_reg = np.array([0.0] + [1.0 for i in beta])
+        else:
+            h_reg = np.ones(beta.shape)
+    else:
+        h_reg = []
+        for k in range(0, beta.shape[0] + int(fit_intercept)):
+            InvCov = np.dot(Tau.T, Tau)
+            if fit_intercept:
+                hk_reg = InvCov[k - 1, k - 1]
+            else:
+                hk_reg = InvCov[k, k]
+            h_reg.append(hk_reg)
+        h_reg = np.array(h_reg)
+    return h_reg
+
+def _gradhess_reg(alpha, Tau, reg_lambda, beta, fit_intercept=True):
+    g_reg = _grad_reg(alpha, Tau, reg_lambda, beta, fit_intercept)
+    h_reg = _hess_reg(alpha, Tau, reg_lambda, beta, fit_intercept)
+    return g_reg, h_reg
 
 def simulate_glm(distr, beta0, beta, X, eta=2.0, random_state=None,
                  sample=False):
@@ -668,7 +927,7 @@ class GLM(BaseEstimator):
             result[~idxs_to_update] = 0.0
 
             return result
-
+    
     def _cdfast(self, X, y, ActiveSet, beta, rl, fit_intercept=True):
         """
         Perform one cycle of Newton updates for all coordinates.
@@ -712,23 +971,13 @@ class GLM(BaseEstimator):
                     xk = X[:, k]
 
                 # Calculate grad and hess of log likelihood term
-                gk, hk = _gradhess_logloss_1d(self.distr, xk, y, z, self.eta,
-                                              fit_intercept)
+                gk, hk = _gradhess_logloss_1d(
+                    self.distr, xk, y, z, self.eta,
+                    fit_intercept)
 
                 # Add grad and hess of regularization term
-                if self.Tau is None:
-                    if k == 0 and fit_intercept:
-                        gk_reg, hk_reg = 0.0, 0.0
-                    else:
-                        gk_reg, hk_reg = beta[k], 1.0
-                else:
-                    InvCov = np.dot(self.Tau.T, self.Tau)
-                    if fit_intercept:
-                        gk_reg = np.sum(InvCov[k - 1, :] * beta[1:])
-                        hk_reg = InvCov[k - 1, k - 1]
-                    else:
-                        gk_reg = np.sum(InvCov[k, :] * beta)
-                        hk_reg = InvCov[k, k]
+                gk_reg, hk_reg = _gradhess_reg_1d(
+                    self.Tau, k, beta, fit_intercept)
                 gk += reg_scale * gk_reg
                 hk += reg_scale * hk_reg
 
@@ -807,61 +1056,89 @@ class GLM(BaseEstimator):
             else:
                 beta = self.beta_
 
-        logger.info('Lambda: %6.4f' % self.reg_lambda)
+        logger.info('Lambda: %6.6f' % self.reg_lambda)
 
         tol = self.tol
         alpha = self.alpha
         reg_lambda = self.reg_lambda
+        reg_scale = reg_lambda * (1 - alpha)
 
         if self.solver == 'cdfast':
             # init active set
             ActiveSet = np.ones_like(beta)
 
         # Iterative updates
-        for t in range(0, self.max_iter):
-            self.n_iter_ += 1
-            beta_old = beta.copy()
-            if self.solver == 'batch-gradient':
-                grad = _grad_L2loss(self.distr,
-                                    alpha, self.Tau,
-                                    reg_lambda, X, y, self.eta,
-                                    beta, self.fit_intercept)
-                # Update
-                beta = beta - self.learning_rate * grad
+        if self.solver in ['Nelder-Mead', 'BFGS', 'L-BFGS-B', 'Newton-CG']:
+            def lFun(beta_):
+                J, gJ = _loss_grad(
+                    self.distr, self.alpha, self.Tau,
+                    self.reg_lambda, X, y, self.eta, self.group, beta_,
+                    fit_intercept=self.fit_intercept, summation=True)
+                return J, gJ
+            methodOpts = scipy_opt.show_options(
+                solver='minimize', method=self.solver, disp=False)
+            minOpts = {'maxiter': self.max_iter, 'disp': self.verbose}
+            if 'xtol ' in methodOpts:
+                minOpts.update({'xtol': self.tol})
+            if 'ftol ' in methodOpts:
+                minOpts.update({'ftol': self.tol})
+            # if 'ftol ' in methodOpts:
+            #     minOpts.update({'ftol': self.tol})
+            if self.solver == 'L-BFGS-B':
+                minOpts.update({'maxcor': 5})
+            res = scipy_opt.minimize(
+                lFun, beta.copy(), method=self.solver,
+                options=minOpts,
+                jac=True,
+                callback=self.callback)
+            # save optimization results
+            beta = res.x
+            self.n_iter_ = res.nit
+        else:
+            for t in range(0, self.max_iter):
+                self.n_iter_ += 1
+                beta_old = beta.copy()
+                if self.solver == 'batch-gradient':
+                    grad = _grad_L2loss(self.distr,
+                        alpha, self.Tau,
+                        reg_lambda, X, y, self.eta,
+                        beta, self.fit_intercept)
+                    # Update
+                    beta = beta - self.learning_rate * grad
 
-            elif self.solver == 'cdfast':
-                beta = \
-                    self._cdfast(X, y, ActiveSet, beta, reg_lambda,
-                                 self.fit_intercept)
+                elif self.solver == 'cdfast':
+                    beta = \
+                        self._cdfast(X, y, ActiveSet, beta, reg_lambda,
+                                     self.fit_intercept)
 
-            else:
-                raise ValueError("solver must be one of "
-                                 "'('batch-gradient', 'cdfast'), got %s."
-                                 % (self.solver))
+                else:
+                    raise ValueError("solver must be one of "
+                                     "'('batch-gradient', 'cdfast'), got %s."
+                                     % (self.solver))
 
-            # Apply proximal operator
-            if self.fit_intercept:
-                beta[1:] = self._prox(beta[1:], reg_lambda * alpha)
-            else:
-                beta = self._prox(beta, reg_lambda * alpha)
-
-            # Update active set
-            if self.solver == 'cdfast':
-                ActiveSet[beta == 0] = 0
+                # Apply proximal operator
                 if self.fit_intercept:
-                    ActiveSet[0] = 1.
+                    beta[1:] = self._prox(beta[1:], reg_lambda * alpha)
+                else:
+                    beta = self._prox(beta, reg_lambda * alpha)
 
-            # Convergence by relative parameter change tolerance
-            norm_update = np.linalg.norm(beta - beta_old)
-            if t > 1 and (norm_update / np.linalg.norm(beta)) < tol:
-                msg = ('\tParameter update tolerance. ' +
-                       'Converged in {0:d} iterations'.format(t))
-                logger.info(msg)
-                break
+                # Update active set
+                if self.solver == 'cdfast':
+                    ActiveSet[beta == 0] = 0
+                    if self.fit_intercept:
+                        ActiveSet[0] = 1.
 
-            # Compute and save loss if callbacks are requested
-            if callable(self.callback):
-                self.callback(beta)
+                # Convergence by relative parameter change tolerance
+                norm_update = np.linalg.norm(beta - beta_old)
+                if t > 1 and (norm_update / np.linalg.norm(beta)) < tol:
+                    msg = ('\tParameter update tolerance. ' +
+                           'Converged in {0:d} iterations'.format(t))
+                    logger.info(msg)
+                    break
+
+                # Compute and save loss if callbacks are requested
+                if callable(self.callback):
+                    self.callback(beta)
 
         if self.n_iter_ == self.max_iter:
             warnings.warn(
